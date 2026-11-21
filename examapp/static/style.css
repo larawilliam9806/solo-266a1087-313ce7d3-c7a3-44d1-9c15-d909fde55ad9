@@ -148,6 +148,8 @@ td.danger { color: var(--danger); font-weight: 600; }
 
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 
+tfoot td { font-weight: 600; border-top: 2px solid var(--line); }
+
 .runlist { list-style: none; padding: 0; margin: 0; }
 .runlist li { display: flex; gap: 12px; align-items: baseline; padding: 5px 0; border-bottom: 1px dashed var(--line); }
 .runlist a { color: var(--accent); text-decoration: none; }

@@ -49,6 +49,7 @@ def create_app(db_path: str | None = None, sync_jobs: bool | None = None) -> Fla
     init_db(app.config["DB_PATH"])
     app.worker = JobWorker(app.config["DB_PATH"], sync=app.config["SYNC_JOBS"])
     app.teardown_appcontext(close_db)
+    app.add_template_filter(lambda v: f"+{v}" if v > 0 else str(v), "signed")
     register_routes(app)
     return app
 
@@ -408,6 +409,32 @@ def is_recomputing(conn) -> bool:
     ).fetchone() is not None
 
 
+def compare_in_transaction(db_path: str, old_id: int, new_id: int, code: str) -> dict:
+    """Run a two-version comparison inside one read transaction.
+
+    The comparison only reads, so imports and corrections keep flowing
+    through the job worker while it runs.  Holding a single WAL read
+    snapshot also means a pruning commit that lands mid-comparison cannot
+    pull the selected runs (or their shared recompute material) away: an
+    already-started comparison still finishes with the two chosen versions.
+    """
+    conn = connect(db_path)
+    try:
+        conn.execute("BEGIN")
+        # Pin the read snapshot at once: a deferred transaction only takes its
+        # snapshot on the first read, and we want "started" to mean started.
+        conn.execute("SELECT 1 FROM runs LIMIT 1").fetchone()
+        try:
+            result = engine.compare_snapshots(conn, old_id, new_id, code)
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+        return result
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
@@ -481,6 +508,52 @@ def register_routes(app: Flask):
         return render_template(
             "cards.html", run=view,
             error=request.args.get("error"), message=request.args.get("message"),
+        )
+
+    @app.get("/compare")
+    def compare():
+        conn = get_db()
+        runs = [
+            {
+                "id": r["id"],
+                "created_at": r["created_at"],
+                "summary": json.loads(r["summary_json"] or "{}"),
+                "has_material": (
+                    r["answers_id"] is not None and r["criteria_id"] is not None
+                ),
+            }
+            for r in conn.execute(
+                "SELECT id, created_at, summary_json, answers_id, criteria_id "
+                "FROM runs ORDER BY id DESC"
+            )
+        ]
+        codes = sorted(
+            {r["std_code"] for r in conn.execute(
+                "SELECT DISTINCT std_code FROM run_question_stats"
+            )},
+            key=engine._natural_key,
+        )
+        old_id = request.args.get("old", type=int)
+        new_id = request.args.get("new", type=int)
+        code = (request.args.get("code") or "").strip()
+        result = None
+        problems = []
+        if old_id and new_id and code:
+            if old_id == new_id:
+                problems.append("请选择两个不同的快照")
+            else:
+                result = compare_in_transaction(
+                    current_db_path(), old_id, new_id, code
+                )
+                if not result["ok"]:
+                    problems.extend(result["problems"])
+                    result = None
+        elif old_id or new_id or code:
+            problems.append("请同时选择旧版快照、新版快照和标准题码")
+        return render_template(
+            "compare.html", runs=runs, codes=codes,
+            old_id=old_id, new_id=new_id, code=code,
+            result=result, problems=problems,
         )
 
     @app.post("/answers")

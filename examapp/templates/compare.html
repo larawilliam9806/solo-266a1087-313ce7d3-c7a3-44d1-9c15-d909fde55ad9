@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}两版对比{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>两版对比</h2>
+  <p class="muted">
+    选两个保留的统计快照和一个标准题码：系统把<strong>两版答题</strong>分别按<strong>两版口径</strong>
+    （卷式映射 + 人工核对结论，判定规则不变）复算，再以旧版为基准，把该题码下各标准选项、
+    漏答、待核的人数变化分解为「只换答题」「只换口径」与「共同影响」。
+    对比是只读操作，进行期间可照常导入答题与订正题码。
+  </p>
+  {% for p in problems %}
+    <div class="banner error">{{ p }}</div>
+  {% endfor %}
+  {% if runs|length < 2 %}
+    <p class="banner info">
+      保留的快照不足两个，暂无法对比。每次导入答题、补交卷式、订正题码或保存核对结论都会生成新快照。
+    </p>
+  {% endif %}
+  <form method="get" action="{{ url_for('compare') }}" class="inline-form">
+    <select name="old" required>
+      <option value="">旧版快照（基准）</option>
+      {% for r in runs %}
+        <option value="{{ r.id }}" {% if r.id == old_id %}selected{% endif %} {% if not r.has_material %}disabled{% endif %}>
+          #{{ r.id }} · {{ r.created_at }}{% if not r.has_material %}（缺复算资料，无法对比）{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+    <select name="new" required>
+      <option value="">新版快照</option>
+      {% for r in runs %}
+        <option value="{{ r.id }}" {% if r.id == new_id %}selected{% endif %} {% if not r.has_material %}disabled{% endif %}>
+          #{{ r.id }} · {{ r.created_at }}{% if not r.has_material %}（缺复算资料，无法对比）{% endif %}
+        </option>
+      {% endfor %}
+    </select>
+    <select name="code" required>
+      <option value="">标准题码</option>
+      {% for c in codes %}
+        <option value="{{ c }}" {% if c == code %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">对比</button>
+  </form>
+  <p class="muted small">
+    快照滚动保留最近 6 份，过期自动清理；缺复算资料的早期快照无法参与对比。
+    已开始的对比不受随后清理影响，仍按所选两版算完。
+  </p>
+</section>
+
+{% if result %}
+<section class="card">
+  <h2>题码 {{ result.code }}：快照 #{{ result.old_run.id }} → #{{ result.new_run.id }}</h2>
+  <p class="muted small">
+    旧版 <a href="{{ url_for('run_detail', run_id=result.old_run.id) }}">快照 #{{ result.old_run.id }}</a>
+    （{{ result.old_run.created_at }} · {{ result.cards.old }} 卡）；
+    新版 <a href="{{ url_for('run_detail', run_id=result.new_run.id) }}">快照 #{{ result.new_run.id }}</a>
+    （{{ result.new_run.created_at }} · {{ result.cards.new }} 卡）。
+    {% if result.same_answers %}两版答题内容相同，共用一份复算资料。{% endif %}
+    {% if result.same_criteria %}两版口径相同，共用一份复算资料。{% endif %}
+  </p>
+  <div class="table-wrap">
+  <table class="stats">
+    <thead>
+      <tr>
+        <th>项目</th>
+        <th>旧版 #{{ result.old_run.id }}</th>
+        <th>新版 #{{ result.new_run.id }}</th>
+        <th>新旧差</th>
+        <th>只换答题</th>
+        <th>只换口径</th>
+        <th>共同影响</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in result.rows %}
+      <tr>
+        <td>{% if r.kind == 'option' %}选项 {{ r.label }}{% else %}{{ r.label }}{% endif %}</td>
+        <td>{{ r.old }}</td>
+        <td>{{ r.new }}</td>
+        <td class="{{ 'warn' if r.delta != 0 else '' }}">{{ r.delta | signed }}</td>
+        <td>{{ r.answers_only | signed }}</td>
+        <td>{{ r.criteria_only | signed }}</td>
+        <td>{{ r.joint | signed }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td>合计</td>
+        <td>{{ result.totals.old }}</td>
+        <td>{{ result.totals.new }}</td>
+        <td>{{ result.totals.delta | signed }}</td>
+        <td>{{ result.totals.answers_only | signed }}</td>
+        <td>{{ result.totals.criteria_only | signed }}</td>
+        <td>{{ result.totals.joint | signed }}</td>
+      </tr>
+    </tfoot>
+  </table>
+  </div>
+  <p class="muted small">
+    新旧差 = 只换答题 + 只换口径 + 共同影响；某版没有该题或该选项时按 0 计。
+    人数来自复算：两版答题 × 两版口径共四种组合，按同一套判定规则得出。
+  </p>
+</section>
+{% endif %}
+{% endblock %}

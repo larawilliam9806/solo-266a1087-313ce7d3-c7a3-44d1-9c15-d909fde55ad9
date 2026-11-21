@@ -91,7 +91,10 @@
 
 {% if runs|length > 1 %}
 <section class="card">
-  <h2>历史统计快照</h2>
+  <div class="row-between">
+    <h2>历史统计快照</h2>
+    <a class="button ghost" href="{{ url_for('compare') }}">两版对比</a>
+  </div>
   <ul class="runlist">
     {% for r in runs %}
       <li>

@@ -9,7 +9,9 @@ always become visible at the same moment.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
 import re
 from collections import OrderedDict
 
@@ -376,16 +378,151 @@ def compute(conn) -> Analysis:
     return analyse(load_forms(conn), load_card_rows(conn), load_decisions(conn))
 
 
+# --------------------------------------------------------------------------
+# Recompute material: per-run frozen copies of answers and criteria
+# --------------------------------------------------------------------------
+
+def _hash_lines(lines) -> str:
+    h = hashlib.sha256()
+    for line in lines:
+        h.update(line.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def snapshot_answers(conn, created_at: str) -> int:
+    """Freeze the live answer_rows as a shared set.
+
+    Identical content reuses the existing copy (未变的答题共用一份).
+    Caller owns the transaction.
+    """
+    rows = [
+        (r["card_no"], r["q_no"], r["letter"], r["scanned_code"])
+        for r in conn.execute(
+            "SELECT card_no, q_no, letter, scanned_code FROM answer_rows "
+            "ORDER BY card_no, q_no"
+        )
+    ]
+    digest = _hash_lines("\t".join(row) for row in rows)
+    existing = conn.execute(
+        "SELECT id FROM snap_answers WHERE hash = ?", (digest,)
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    set_id = conn.execute(
+        "INSERT INTO snap_answers(hash, created_at) VALUES (?, ?)",
+        (digest, created_at),
+    ).lastrowid
+    conn.executemany(
+        "INSERT INTO snap_answer_rows(set_id, card_no, q_no, letter, scanned_code) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(set_id, *row) for row in rows],
+    )
+    return set_id
+
+
+def snapshot_criteria(conn, created_at: str) -> int:
+    """Freeze the live criteria (form mappings + review decisions) as a shared set."""
+    form_rows = [
+        (r["name"], r["q_no"], r["letter"], r["std_code"], r["std_option"])
+        for r in conn.execute(
+            "SELECT f.name, m.q_no, m.letter, m.std_code, m.std_option "
+            "FROM forms f JOIN form_mappings m ON m.form_id = f.id "
+            "ORDER BY f.name, m.q_no, m.letter"
+        )
+    ]
+    decision_rows = [
+        (r["card_no"], r["std_code"], r["resolution"], r["note"])
+        for r in conn.execute(
+            "SELECT card_no, std_code, resolution, note FROM review_decisions "
+            "ORDER BY card_no, std_code"
+        )
+    ]
+    digest = _hash_lines(
+        ["F\t" + "\t".join(row) for row in form_rows]
+        + ["D\t" + "\t".join(row) for row in decision_rows]
+    )
+    existing = conn.execute(
+        "SELECT id FROM snap_criteria WHERE hash = ?", (digest,)
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    set_id = conn.execute(
+        "INSERT INTO snap_criteria(hash, created_at) VALUES (?, ?)",
+        (digest, created_at),
+    ).lastrowid
+    conn.executemany(
+        "INSERT INTO snap_criteria_forms"
+        "(set_id, form_name, q_no, letter, std_code, std_option) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [(set_id, *row) for row in form_rows],
+    )
+    conn.executemany(
+        "INSERT INTO snap_criteria_decisions"
+        "(set_id, card_no, std_code, resolution, note) VALUES (?, ?, ?, ?, ?)",
+        [(set_id, *row) for row in decision_rows],
+    )
+    return set_id
+
+
+def load_answer_snapshot(conn, set_id: int) -> dict:
+    """Rebuild {card_no: {q_no: {letter, scanned_code}}} from a frozen set."""
+    cards: dict[str, dict] = {}
+    for r in conn.execute(
+        "SELECT card_no, q_no, letter, scanned_code FROM snap_answer_rows "
+        "WHERE set_id = ? ORDER BY card_no, q_no",
+        (set_id,),
+    ):
+        cards.setdefault(r["card_no"], {})[r["q_no"]] = {
+            "letter": r["letter"], "scanned_code": r["scanned_code"],
+        }
+    return cards
+
+
+def load_criteria_snapshot(conn, set_id: int):
+    """Rebuild (forms, decisions) from a frozen criteria set."""
+    name_ids: dict[str, int] = {}
+    typed = []
+    for r in conn.execute(
+        "SELECT form_name, q_no, letter, std_code, std_option "
+        "FROM snap_criteria_forms WHERE set_id = ? ORDER BY form_name, q_no, letter",
+        (set_id,),
+    ):
+        fid = name_ids.setdefault(r["form_name"], len(name_ids) + 1)
+        typed.append((fid, r["form_name"], r["q_no"], r["letter"],
+                      r["std_code"], r["std_option"]))
+    forms = build_forms(typed)
+    decisions = {
+        (r["card_no"], r["std_code"]): {
+            "resolution": r["resolution"], "note": r["note"],
+        }
+        for r in conn.execute(
+            "SELECT card_no, std_code, resolution, note "
+            "FROM snap_criteria_decisions WHERE set_id = ?",
+            (set_id,),
+        )
+    }
+    return forms, decisions
+
+
 def persist_run(conn, analysis: Analysis, created_at: str) -> int:
-    """Insert a full snapshot and return its run id. Caller owns the transaction."""
+    """Insert a full snapshot and return its run id. Caller owns the transaction.
+
+    The frozen recompute material (answers + criteria) is linked in the same
+    transaction, so a new run and the data needed to recompute it always take
+    effect together.
+    """
     cur = conn.execute(
         "INSERT INTO runs(created_at, summary_json) VALUES (?, '{}')", (created_at,)
     )
     run_id = cur.lastrowid
-    import json
+    answers_id = snapshot_answers(conn, created_at)
+    criteria_id = snapshot_criteria(conn, created_at)
     conn.execute(
-        "UPDATE runs SET summary_json = ? WHERE id = ?",
-        (json.dumps(analysis.summary(), ensure_ascii=False), run_id),
+        "UPDATE runs SET summary_json = ?, answers_id = ?, criteria_id = ? "
+        "WHERE id = ?",
+        (json.dumps(analysis.summary(), ensure_ascii=False),
+         answers_id, criteria_id, run_id),
     )
     conn.executemany(
         "INSERT INTO run_question_stats(run_id, std_code, counted, blank, flagged) "
@@ -417,3 +554,109 @@ def prune_runs(conn, keep: int = 4) -> None:
     ).fetchall()
     for r in rows:
         conn.execute("DELETE FROM runs WHERE id = ?", (r["id"],))
+    # Reclaim recompute material no retained run references any more.
+    conn.execute(
+        "DELETE FROM snap_answers WHERE id NOT IN "
+        "(SELECT answers_id FROM runs WHERE answers_id IS NOT NULL)"
+    )
+    conn.execute(
+        "DELETE FROM snap_criteria WHERE id NOT IN "
+        "(SELECT criteria_id FROM runs WHERE criteria_id IS NOT NULL)"
+    )
+
+
+# --------------------------------------------------------------------------
+# Two-version comparison
+# --------------------------------------------------------------------------
+
+def compare_snapshots(conn, old_run_id: int, new_run_id: int, std_code: str) -> dict:
+    """Recompute two snapshots' answers under both snapshots' criteria.
+
+    The two frozen answer sets are scored against the two frozen criteria
+    (form mappings + human review decisions) with the unchanged judging
+    rules, giving a 2x2 cross table for one standard question code.  With
+    the old version as baseline:
+
+        只换答题 = (新答题, 旧口径) - (旧答题, 旧口径)
+        只换口径 = (旧答题, 新口径) - (旧答题, 旧口径)
+        共同影响 = (新版 - 旧版) - 只换答题 - 只换口径
+
+    Questions or options missing from a version count as zero.
+    """
+    old_run = conn.execute("SELECT * FROM runs WHERE id = ?", (old_run_id,)).fetchone()
+    new_run = conn.execute("SELECT * FROM runs WHERE id = ?", (new_run_id,)).fetchone()
+    problems = []
+    if old_run is None:
+        problems.append(f"旧版快照 #{old_run_id} 不存在或已被清理")
+    if new_run is None:
+        problems.append(f"新版快照 #{new_run_id} 不存在或已被清理")
+    for label, run in (("旧版", old_run), ("新版", new_run)):
+        if run is not None and (run["answers_id"] is None or run["criteria_id"] is None):
+            problems.append(
+                f"{label}快照 #{run['id']} 缺少复算资料（早于对比功能），无法对比"
+            )
+    if problems:
+        return {"ok": False, "problems": problems}
+
+    cards_old = load_answer_snapshot(conn, old_run["answers_id"])
+    forms_old, decisions_old = load_criteria_snapshot(conn, old_run["criteria_id"])
+    cards_new = load_answer_snapshot(conn, new_run["answers_id"])
+    forms_new, decisions_new = load_criteria_snapshot(conn, new_run["criteria_id"])
+
+    base_old = analyse(forms_old, cards_old, decisions_old)      # 旧答题 × 旧口径
+    swapped_criteria = analyse(forms_new, cards_old, decisions_new)  # 旧答题 × 新口径
+    swapped_answers = analyse(forms_old, cards_new, decisions_old)   # 新答题 × 旧口径
+    base_new = analyse(forms_new, cards_new, decisions_new)      # 新答题 × 新口径
+
+    def cell(result: Analysis) -> dict:
+        return result.stats.get(
+            std_code, {"counted": 0, "blank": 0, "flagged": 0, "options": {}}
+        )
+
+    s_old = cell(base_old)
+    s_old_new_criteria = cell(swapped_criteria)
+    s_new_old_answers = cell(swapped_answers)
+    s_new = cell(base_new)
+
+    option_names = sorted(
+        set().union(
+            s_old["options"], s_old_new_criteria["options"],
+            s_new_old_answers["options"], s_new["options"],
+        ),
+        key=_natural_key,
+    )
+
+    def make_row(label, kind, pick):
+        old_v = pick(s_old)
+        new_v = pick(s_new)
+        answers_only = pick(s_new_old_answers) - old_v
+        criteria_only = pick(s_old_new_criteria) - old_v
+        joint = (new_v - old_v) - answers_only - criteria_only
+        return {
+            "label": label, "kind": kind, "old": old_v, "new": new_v,
+            "delta": new_v - old_v, "answers_only": answers_only,
+            "criteria_only": criteria_only, "joint": joint,
+        }
+
+    rows = [
+        make_row(opt, "option", lambda s, o=opt: s["options"].get(o, 0))
+        for opt in option_names
+    ]
+    rows.append(make_row("漏答", "blank", lambda s: s["blank"]))
+    rows.append(make_row("待核", "flagged", lambda s: s["flagged"]))
+    totals = {
+        key: sum(row[key] for row in rows)
+        for key in ("old", "new", "delta", "answers_only", "criteria_only", "joint")
+    }
+
+    return {
+        "ok": True,
+        "code": std_code,
+        "old_run": {"id": old_run["id"], "created_at": old_run["created_at"]},
+        "new_run": {"id": new_run["id"], "created_at": new_run["created_at"]},
+        "same_answers": old_run["answers_id"] == new_run["answers_id"],
+        "same_criteria": old_run["criteria_id"] == new_run["criteria_id"],
+        "cards": {"old": len(cards_old), "new": len(cards_new)},
+        "rows": rows,
+        "totals": totals,
+    }

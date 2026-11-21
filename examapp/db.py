@@ -51,8 +51,56 @@ CREATE TABLE IF NOT EXISTS review_decisions (
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at   TEXT NOT NULL,
-    summary_json TEXT NOT NULL DEFAULT '{}'
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    answers_id   INTEGER REFERENCES snap_answers(id),
+    criteria_id  INTEGER REFERENCES snap_criteria(id)
 );
+
+-- Recompute material frozen alongside each run snapshot: the answer rows and
+-- the criteria (form mappings + human review decisions) the run was judged
+-- under.  Identical content is stored once (deduplicated by hash) and shared
+-- by every run that references it; sets no run references are reclaimed.
+CREATE TABLE IF NOT EXISTS snap_answers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snap_answer_rows (
+    set_id       INTEGER NOT NULL REFERENCES snap_answers(id) ON DELETE CASCADE,
+    card_no      TEXT NOT NULL,
+    q_no         TEXT NOT NULL,
+    letter       TEXT NOT NULL DEFAULT '',
+    scanned_code TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_snap_answer_rows_set ON snap_answer_rows(set_id);
+
+CREATE TABLE IF NOT EXISTS snap_criteria (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snap_criteria_forms (
+    set_id     INTEGER NOT NULL REFERENCES snap_criteria(id) ON DELETE CASCADE,
+    form_name  TEXT NOT NULL,
+    q_no       TEXT NOT NULL,
+    letter     TEXT NOT NULL,
+    std_code   TEXT NOT NULL,
+    std_option TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snap_criteria_forms_set
+    ON snap_criteria_forms(set_id);
+
+CREATE TABLE IF NOT EXISTS snap_criteria_decisions (
+    set_id     INTEGER NOT NULL REFERENCES snap_criteria(id) ON DELETE CASCADE,
+    card_no    TEXT NOT NULL,
+    std_code   TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_snap_criteria_decisions_set
+    ON snap_criteria_decisions(set_id);
 
 CREATE TABLE IF NOT EXISTS run_question_stats (
     run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -134,6 +182,20 @@ def init_db(db_path: str) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('state_version', '0')"
         )
+        # Migrate databases created before run comparisons existed: runs gain
+        # links to their frozen recompute material.  Old runs keep NULLs and
+        # are reported as "缺少复算资料，无法对比".
+        run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+        if "answers_id" not in run_cols:
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN answers_id "
+                "INTEGER REFERENCES snap_answers(id)"
+            )
+        if "criteria_id" not in run_cols:
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN criteria_id "
+                "INTEGER REFERENCES snap_criteria(id)"
+            )
         # Jobs interrupted by a restart are safe to replay: the payload is
         # persisted and each job's transaction either committed or rolled back.
         conn.execute(

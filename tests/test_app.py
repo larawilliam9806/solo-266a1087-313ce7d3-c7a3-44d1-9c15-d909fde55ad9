@@ -531,3 +531,262 @@ def test_queued_job_replayed_after_restart(app):
         time.sleep(0.05)
     assert result is not None
     assert result["stats"]["Q1"]["counted"] == 1
+
+
+# --------------------------------------------------------------------------
+# Two-version comparison
+# --------------------------------------------------------------------------
+
+def run_rows(app):
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        try:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, answers_id, criteria_id FROM runs ORDER BY id"
+            )]
+        finally:
+            conn.close()
+
+
+def compare_via_engine(app, old_id, new_id, code):
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        try:
+            return engine.compare_snapshots(conn, old_id, new_id, code)
+        finally:
+            conn.close()
+
+
+def test_runs_freeze_material_and_share_unchanged_parts(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "A", ""),
+    ]))
+    form_b = form_csv([
+        ("1", "A", "Q1", "A"), ("1", "B", "Q1", "B"),
+        ("2", "A", "Q2", "A"), ("2", "B", "Q2", "B"),
+    ])
+    upload(client, "/forms", form_b, name="B卷")
+    runs = run_rows(app)
+    assert all(r["answers_id"] and r["criteria_id"] for r in runs)
+    # The form upload did not touch the answers: same frozen answer set.
+    assert runs[-1]["answers_id"] == runs[-2]["answers_id"]
+    # The criteria did change: a different frozen criteria set.
+    assert runs[-1]["criteria_id"] != runs[-2]["criteria_id"]
+
+    # Re-uploading identical answers reuses the very same set again.
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "A", ""),
+    ]))
+    runs = run_rows(app)
+    assert runs[-1]["answers_id"] == runs[-2]["answers_id"]
+
+    # A review conclusion is part of the criteria: it changes the set.
+    client.post("/review", data={
+        "card_no": "C1", "std_code": "Q1", "resolution": "blank", "note": "",
+    }, follow_redirects=True)
+    runs = run_rows(app)
+    assert runs[-1]["criteria_id"] != runs[-2]["criteria_id"]
+    assert runs[-1]["answers_id"] == runs[-2]["answers_id"]
+
+
+def test_pruning_reclaims_unreferenced_material(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    for i in range(8):
+        # Each upload is distinct (extra card per round) -> distinct answer sets.
+        upload(client, "/answers", answer_csv([
+            ("C1", "1", "A", ""), ("C1", "2", "A", ""),
+            (f"X{i}", "1", "A", ""), (f"X{i}", "2", "B", ""),
+        ]))
+    runs = run_rows(app)
+    assert len(runs) == 6  # keep=6 rolling window
+    referenced_answers = {r["answers_id"] for r in runs}
+    referenced_criteria = {r["criteria_id"] for r in runs}
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        try:
+            stored_answers = {
+                r["id"] for r in conn.execute("SELECT id FROM snap_answers")
+            }
+            stored_criteria = {
+                r["id"] for r in conn.execute("SELECT id FROM snap_criteria")
+            }
+            orphan_rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM snap_answer_rows "
+                "WHERE set_id NOT IN (SELECT id FROM snap_answers)"
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+    # Unreferenced sets are reclaimed; shared ones survive.
+    assert stored_answers == referenced_answers
+    assert stored_criteria == referenced_criteria == {runs[0]["criteria_id"]}
+    assert orphan_rows == 0
+
+
+def test_compare_decomposes_answers_and_criteria_effects(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "A", ""),
+        ("C2", "1", "A", ""), ("C2", "2", "B", ""),
+    ]))
+    old_run = current_run(app)["id"]
+    # Change the answers (C1 q1: A -> B) ...
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "A", ""),
+        ("C2", "1", "A", ""), ("C2", "2", "B", ""),
+    ]))
+    # ... and change the criteria (Q1's standard options swapped).
+    swapped = form_csv([
+        ("1", "A", "Q1", "B"), ("1", "B", "Q1", "A"),
+        ("2", "A", "Q2", "A"), ("2", "B", "Q2", "B"),
+    ])
+    upload(client, "/forms", swapped, name="A卷")
+    new_run = current_run(app)["id"]
+
+    result = compare_via_engine(app, old_run, new_run, "Q1")
+    assert result["ok"]
+    rows = {r["label"]: r for r in result["rows"]}
+    # Q1=A: 2 -> 1.  Answers-only: C1 flips A->B (-1);
+    # criteria-only: both A letters now map to B (-2); the rest is joint.
+    assert (rows["A"]["old"], rows["A"]["new"]) == (2, 1)
+    assert (rows["A"]["answers_only"], rows["A"]["criteria_only"],
+            rows["A"]["joint"]) == (-1, -2, 2)
+    assert (rows["B"]["old"], rows["B"]["new"]) == (0, 1)
+    assert (rows["B"]["answers_only"], rows["B"]["criteria_only"],
+            rows["B"]["joint"]) == (1, 2, -2)
+    assert rows["漏答"]["delta"] == 0
+    assert rows["待核"]["delta"] == 0
+    for r in rows.values():
+        assert r["delta"] == r["answers_only"] + r["criteria_only"] + r["joint"]
+
+    page = client.get(f"/compare?old={old_run}&new={new_run}&code=Q1")
+    assert page.status_code == 200
+    html = page.get_data(as_text=True)
+    for heading in ("只换答题", "只换口径", "共同影响", "新旧差"):
+        assert heading in html
+
+
+def test_compare_counts_zero_when_version_lacks_question(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "B", ""),
+    ]))
+    old_run = current_run(app)["id"]
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        form_id = conn.execute("SELECT id FROM forms").fetchone()["id"]
+        conn.close()
+    client.post("/forms/correct", data={
+        "form_id": str(form_id), "q_no": "1", "new_code": "Q1X",
+    }, follow_redirects=True)
+    new_run = current_run(app)["id"]
+
+    result = compare_via_engine(app, old_run, new_run, "Q1")
+    assert result["ok"]
+    rows = {r["label"]: r for r in result["rows"]}
+    # The new criteria no longer contains Q1 at all: everything there is 0,
+    # and the whole drop is attributed to the criteria change.
+    assert rows["A"]["old"] == 1 and rows["A"]["new"] == 0
+    assert rows["A"]["answers_only"] == 0
+    assert rows["A"]["criteria_only"] == -1
+    assert rows["A"]["joint"] == 0
+
+
+def test_compare_marks_snapshot_without_material(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "B", ""),
+    ]))
+    new_run = current_run(app)["id"]
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        # A run predating the comparison feature: no frozen material.
+        legacy_id = conn.execute(
+            "INSERT INTO runs(created_at, summary_json) "
+            "VALUES ('2026-01-01 00:00:00', '{}')"
+        ).lastrowid
+        conn.close()
+
+    result = compare_via_engine(app, legacy_id, new_run, "Q1")
+    assert not result["ok"]
+    assert any("无法对比" in p for p in result["problems"])
+
+    page = client.get(f"/compare?old={legacy_id}&new={new_run}&code=Q1")
+    assert page.status_code == 200
+    assert "无法对比" in page.get_data(as_text=True)
+    # The selector marks the legacy snapshot as not comparable.
+    assert "缺复算资料" in page.get_data(as_text=True)
+
+
+def test_compare_rejects_same_snapshot_twice(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "B", ""),
+    ]))
+    run_id = current_run(app)["id"]
+    page = client.get(f"/compare?old={run_id}&new={run_id}&code=Q1")
+    assert "请选择两个不同的快照" in page.get_data(as_text=True)
+
+
+def test_started_comparison_survives_concurrent_pruning(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", ""), ("C1", "2", "A", ""),
+    ]))
+    old_run = current_run(app)["id"]
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "B", ""), ("C1", "2", "A", ""),
+    ]))
+    new_run = current_run(app)["id"]
+
+    # The comparison starts (read transaction open and pinned) ...
+    conn = db.connect(app.config["DB_PATH"])
+    conn.execute("BEGIN")
+    conn.execute("SELECT 1 FROM runs LIMIT 1").fetchone()
+    try:
+        # ... then a pruning job wipes every run and all material ...
+        other = db.connect(app.config["DB_PATH"])
+        other.execute("DELETE FROM runs")
+        other.execute("DELETE FROM snap_answers")
+        other.execute("DELETE FROM snap_criteria")
+        other.close()
+        # ... but the started comparison still finishes with both versions.
+        result = engine.compare_snapshots(conn, old_run, new_run, "Q1")
+        assert result["ok"]
+        rows = {r["label"]: r for r in result["rows"]}
+        assert (rows["A"]["old"], rows["A"]["new"]) == (1, 0)
+        assert (rows["B"]["old"], rows["B"]["new"]) == (0, 1)
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def test_existing_database_is_migrated(tmp_path):
+    # A database created by the previous version: runs has no material links
+    # and the snap_* tables do not exist yet.
+    db_path = str(tmp_path / "legacy.db")
+    conn = db.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}'
+        );
+        INSERT INTO runs(created_at, summary_json) VALUES ('2026-01-01 00:00:00', '{}');
+    """)
+    conn.close()
+
+    db.init_db(db_path)
+    conn = db.connect(db_path)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+        assert {"answers_id", "criteria_id"} <= cols
+        legacy = conn.execute("SELECT * FROM runs").fetchone()
+        assert legacy["answers_id"] is None and legacy["criteria_id"] is None
+        # The legacy run is reported as not comparable.
+        result = engine.compare_snapshots(conn, legacy["id"], legacy["id"], "Q1")
+        assert not result["ok"]
+        assert any("无法对比" in p for p in result["problems"])
+    finally:
+        conn.close()
